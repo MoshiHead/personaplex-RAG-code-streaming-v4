@@ -79,8 +79,16 @@ class TestBuildScopedKnowledgeBlock(unittest.TestCase):
 
     def test_instructs_the_model_not_to_use_its_own_knowledge(self):
         result = build_scoped_knowledge_block("some facts", "decline phrase")
-        self.assertIn("ONLY", result)
-        self.assertIn("do not guess", result.lower())
+        self.assertIn("Do not use any knowledge from outside this passage", result)
+
+    def test_instructs_the_model_to_answer_confidently_rather_than_default_to_declining(self):
+        # Regression test for the real bug (docs/PRODUCTION_RAG.md): an earlier wording that led
+        # with "answer ONLY... do not guess... decline if not covered" over-corrected a smaller
+        # model toward refusing real, in-document questions. The instruction must explicitly tell
+        # the model not to do that.
+        result = build_scoped_knowledge_block("some facts", "decline phrase")
+        self.assertIn("Never say you don't know", result)
+        self.assertIn("confidently", result)
 
 
 class TestBuildOutOfScopeNotice(unittest.TestCase):

@@ -391,3 +391,94 @@ confirmed by direct measurement against the real RobotBulls knowledge base:
 the new `"ids"` key) cover both fixes, including a regression test using already-score-sorted
 input (mirroring real FAISS output) to prove document order is restored via `ids`, not list
 position. 162 tests pass total.
+
+## 13. Fifth real-pod bug: the model over-refused real, in-document questions
+
+With Sections 8-12's fixes in place, retrieval was confirmed accurate (clean score separation
+between in-scope and out-of-scope questions on the real RobotBulls index) and the entire document
+was confirmed to fit in the injected context, in document order. Despite that, the live model
+still sometimes responded "I don't know" / "that's outside my scope" / "I can't share that
+information" to questions that ARE answered in `text.txt`.
+
+**Root cause: the scope instruction itself (Section 11) over-corrected.** Its original wording led
+with the restriction -- *"You must answer ONLY using the information provided below. Do not use
+any other knowledge you may have, and do not guess or make up an answer. If the user's question is
+not covered by this information, respond only with: \"<refusal_message>\""* -- before the model had
+even read the facts below it. For a 7B streaming model conditioned that heavily toward caution,
+declining is the simplest, lowest-risk completion whenever it isn't immediately certain the
+knowledge block answers the question -- especially once that block runs to ~2,500 tokens (the
+whole RobotBulls document, per Section 12) and the relevant fact isn't a close wording match for
+how the question was phrased. The instruction that was meant to stop hallucination on out-of-scope
+questions was simultaneously biasing the model toward *refusing in-scope ones* -- the opposite
+failure mode, but the same underlying cause (an instruction that makes "decline" the path of least
+resistance).
+
+**Fix:** rewrote `rag.injection_manager.build_scoped_knowledge_block` to lead with confident,
+complete usage of the knowledge instead of the restriction, and to explicitly forbid the exact
+failure mode observed:
+
+> The following is your complete knowledge base. Read all of it carefully and use it to answer the
+> user's questions fully, accurately, and confidently -- most questions the user asks will be
+> answered by something below, even if the wording differs from how they phrase it. Never say you
+> don't know, refuse to answer, or claim information is unavailable if the answer is actually
+> present below -- search the entire passage before deciding it isn't covered. Do not use any
+> knowledge from outside this passage. Only if the user asks about something this passage truly
+> does not address at all, respond only with: "\<refusal_message\>"
+
+The hard constraint from Section 11 (never blend in pretrained knowledge) is unchanged -- only the
+framing and emphasis moved, from "restrict, then mention the facts" to "use the facts confidently,
+restrict only as a narrow fallback." `build_out_of_scope_notice` (used only when retrieval finds
+literally nothing relevant -- a separate, already-confirmed-empty case) is unchanged.
+
+This is a prompt-wording fix, not something verifiable by a unit test against the real model (no
+GPU/model weights are available in this development environment) -- the existing tests assert the
+new wording's key phrases are present (`rag/tests/test_injection_manager.py`). Confirming the
+actual effect on live model behavior requires running the updated notebook against the real
+checkpoint; if over-refusal persists, the next lever to try is narrowing `RAG_DEFAULT_QUERY` (a
+more specific connection-start query measurably changes which facts rank highest within the
+budget, per Section 12) before further adjusting this wording.
+
+## 14. Sixth real-pod bug: streaming silently "freezes" after several minutes with no error
+
+Reported symptom: after roughly 4-5 minutes of continuous live conversation, the assistant stops
+responding entirely -- no further audio or text, no error visible anywhere, and the only recovery
+is starting an entirely new connection. Notably, 4-5 minutes is suspiciously close to how long it
+takes the model's 3000-frame attention window to fill at 12.5Hz (240s = 4 minutes) -- even sooner
+once Section 12's fix is deliberately maximizing how much of the knowledge base gets front-loaded
+into that same window at connection start.
+
+**Root cause, confirmed by code inspection (`moshi/moshi/server.py`): exceptions inside the
+connection's three concurrent loops were silently discarded, not a hang.** `handle_chat` runs
+`recv_loop`, `opus_loop`, and `send_loop` as three `asyncio` tasks and waits on them with
+`asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)`. Two problems compounded:
+
+1. `opus_loop` (where every real per-frame `lm_gen.step()` call happens) had **no exception
+   handling at all**, and `recv_loop` had a `try/finally` with no `except` -- any exception raised
+   inside either (a shape assertion, a tensor/CUDA error, anything) propagated up into the
+   `asyncio.Task` as an *unhandled* exception rather than being caught.
+2. When `asyncio.wait(..., return_when=FIRST_COMPLETED)` returns, the code only ever inspected
+   `pending` (the tasks NOT yet done, which it cancels) -- it never called `.exception()` on the
+   task in `done` that actually finished (because it crashed). The exception was therefore never
+   logged, never raised, never used to decide how to close the socket -- `ws.close()` ran
+   unconditionally as if the connection had ended normally.
+
+Net effect: whatever the real per-frame exception was (RingKVCache wraparound itself was
+inspected directly and is NOT the bug -- its modulo-indexed read/write and position math in
+`moshi/moshi/modules/transformer.py`'s `RingKVCache.complete()` is correct; depformer state,
+rotary embeddings, and CUDA-graph argument handling were also inspected and ruled out), the
+connection silently stopped producing output while the websocket stayed open, looking exactly like
+a "freeze" with no diagnosable cause -- because the cause was being thrown away, not because
+anything actually hung.
+
+**Fix:** `recv_loop`/`opus_loop`/`send_loop` now each catch `Exception`, log the full traceback via
+`clog`, and set `close = True` so the other two loops wind down too instead of one dying silently
+while the others idle forever. `handle_chat` also now checks `task.exception()` for every task in
+`done` (not just cancelling `pending`) and logs it. This does not change what causes the
+underlying exception (still unknown -- the swallowing made it unobservable before now) -- it
+converts an indefinite, unrecoverable, silent "freeze" into an immediate, logged, clean connection
+close, which is both a real fix (the client can detect the close and reconnect, instead of waiting
+forever on a connection that will never respond again) and what makes the actual root cause
+diagnosable: the next occurrence will have a full traceback in the server log instead of nothing.
+Section 12's reserve-frames change makes the attention window fill sooner, which may make whatever
+the underlying exception is reproduce sooner/more often too -- if the logged traceback points back
+to RAG's burst-injection path specifically, that is the next place to look.

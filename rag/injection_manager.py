@@ -72,15 +72,30 @@ def build_scoped_knowledge_block(knowledge_block: str, refusal_message: str) -> 
     to blend its own pretrained knowledge in alongside (or instead of) the retrieved facts; this
     text is what tells it not to.
 
+    Deliberately framed "use this confidently and completely" FIRST, with the decline instruction
+    narrowed and secondary -- an earlier version led with "answer ONLY... do not guess... if not
+    covered, respond with X", which over-corrected: a smaller model primed that heavily toward
+    caution defaulted to the easy, explicit fallback (declining) even for questions the knowledge
+    block actually answered, especially once the block runs to a few thousand tokens and the
+    relevant fact isn't a verbatim match for the question's wording (see
+    docs/PRODUCTION_RAG.md Section 13 for the real, observed "I don't know"/"outside my scope"
+    failures this caused). The fix keeps the same hard constraint (never blend in pretrained
+    knowledge) while removing the bias toward refusing when the answer IS present.
+
     `refusal_message` is the exact phrase the model should fall back to for anything the knowledge
     doesn't cover -- see `RAGConfig.refusal_message`. Pure string formatting, independent of
     whether the caller wraps the result in `<system>` tags (`InjectionRequest.wrap_system_tags`)
     or not, so it composes with every injection mode (B/C/D/E/F) unchanged.
     """
     return (
-        "You must answer ONLY using the information provided below. Do not use any other "
-        "knowledge you may have, and do not guess or make up an answer. If the user's question "
-        f"is not covered by this information, respond only with: \"{refusal_message}\"\n\n"
+        "The following is your complete knowledge base. Read all of it carefully and use it to "
+        "answer the user's questions fully, accurately, and confidently -- most questions the "
+        "user asks will be answered by something below, even if the wording differs from how "
+        "they phrase it. Never say you don't know, refuse to answer, or claim information is "
+        "unavailable if the answer is actually present below -- search the entire passage before "
+        "deciding it isn't covered. Do not use any knowledge from outside this passage. Only if "
+        "the user asks about something this passage truly does not address at all, respond only "
+        f"with: \"{refusal_message}\"\n\n"
         f"{knowledge_block}"
     )
 

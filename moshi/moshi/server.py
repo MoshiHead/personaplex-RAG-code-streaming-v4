@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 import tarfile
 import time
+import traceback
 import secrets
 import sys
 from typing import Literal, Optional
@@ -282,93 +283,123 @@ class ServerState:
                         opus_reader.append_bytes(payload)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
+            except Exception:
+                # Without this, an exception here (e.g. a transport error) would propagate out of
+                # the task unobserved -- see the comment above `done, pending = await
+                # asyncio.wait(...)` below for why that silently "freezes" the connection instead
+                # of closing it. Log the full traceback so the actual cause is diagnosable, then
+                # fall through to `finally` so the other loops stop via `close`.
+                clog.log("error", f"recv_loop crashed:\n{traceback.format_exc()}")
             finally:
                 close = True
                 clog.log("info", "connection closed")
 
         async def opus_loop():
+            nonlocal close
             all_pcm_data = None
 
-            while True:
-                if close:
-                    return
-                await asyncio.sleep(0.001)
+            try:
+                while True:
+                    if close:
+                        return
+                    await asyncio.sleep(0.001)
 
-                pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
-                    continue
-                if all_pcm_data is None:
-                    all_pcm_data = pcm
-                else:
-                    all_pcm_data = np.concatenate((all_pcm_data, pcm))
-                while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
-                    chunk = all_pcm_data[: self.frame_size]
-                    all_pcm_data = all_pcm_data[self.frame_size:]
-                    # Mode D: feed the *raw* user-audio frame to the turn-boundary detector before
-                    # it's converted to a torch tensor below. No-op unless turn_injection + VAD are
-                    # both active (see RAGSession.observe_user_frame). If a boundary just fired,
-                    # await the prepared knowledge as ONE self-contained, async-checkpointed burst
-                    # -- BEFORE this frame's real self.lm_gen.step() call below, never interleaved
-                    # with it. A real run showed interleaving forced steps with the real generation
-                    # loop corrupts both the transcript and the spoken audio (forcing text_token=X
-                    # always means "the model says X right now," not "X is new context" -- see
-                    # rag/injection_manager.py's warning and docs/MODE_D_REDESIGN.md). The async
-                    # variant yields between forced steps so recv_loop/send_loop aren't starved for
-                    # the whole burst, but still fully completes before this frame's real step --
-                    # opus_loop is the only coroutine that ever calls self.lm_gen.step(), so this
-                    # remains safe under the concurrency contract in
-                    # docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.1.
-                    if self.rag_session is not None and self.rag_session.observe_user_frame(chunk):
-                        turn_record = await self.rag_session.fire_turn_injection_burst_async()
-                        clog.log(
-                            "info",
-                            f"[rag] turn boundary detected -> fired burst: "
-                            f"injected_tokens={turn_record['injected_token_count']} "
-                            f"injection_latency_s={turn_record.get('injection_latency_s')}",
-                        )
-                    # Mode E: fires on a fixed wall-clock interval regardless of turn boundaries --
-                    # no-op unless dynamic_runtime is active and prepare_dynamic_injection_knowledge()
-                    # has armed a knowledge block. Same self-contained-burst-before-this-frame's-real-
-                    # step contract as Mode D above.
-                    if self.rag_session is not None and self.rag_session.tick_dynamic_injection():
-                        dyn_record = await self.rag_session.fire_dynamic_injection_burst_async()
-                        clog.log(
-                            "info",
-                            f"[rag] dynamic-injection interval elapsed -> fired burst: "
-                            f"injected_tokens={dyn_record['injected_token_count']} "
-                            f"injection_latency_s={dyn_record.get('injection_latency_s')}",
-                        )
-                    chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
-                    codes = self.mimi.encode(chunk)
-                    _ = self.other_mimi.encode(chunk)
-                    for c in range(codes.shape[-1]):
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                        if tokens is None:
-                            continue
-                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
-                        main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
-                        text_token = tokens[0, 0, 0].item()
-                        if text_token not in (0, 3):
-                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                            _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
-                            await ws.send_bytes(msg)
-                        else:
-                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    pcm = opus_reader.read_pcm()
+                    if pcm.shape[-1] == 0:
+                        continue
+                    if all_pcm_data is None:
+                        all_pcm_data = pcm
+                    else:
+                        all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                    while all_pcm_data.shape[-1] >= self.frame_size:
+                        be = time.time()
+                        chunk = all_pcm_data[: self.frame_size]
+                        all_pcm_data = all_pcm_data[self.frame_size:]
+                        # Mode D: feed the *raw* user-audio frame to the turn-boundary detector
+                        # before it's converted to a torch tensor below. No-op unless
+                        # turn_injection + VAD are both active (see
+                        # RAGSession.observe_user_frame). If a boundary just fired, await the
+                        # prepared knowledge as ONE self-contained, async-checkpointed burst --
+                        # BEFORE this frame's real self.lm_gen.step() call below, never
+                        # interleaved with it. A real run showed interleaving forced steps with
+                        # the real generation loop corrupts both the transcript and the spoken
+                        # audio (forcing text_token=X always means "the model says X right now,"
+                        # not "X is new context" -- see rag/injection_manager.py's warning and
+                        # docs/MODE_D_REDESIGN.md). The async variant yields between forced steps
+                        # so recv_loop/send_loop aren't starved for the whole burst, but still
+                        # fully completes before this frame's real step -- opus_loop is the only
+                        # coroutine that ever calls self.lm_gen.step(), so this remains safe under
+                        # the concurrency contract in docs/STREAMING_AND_INJECTION_DESIGN.md
+                        # Section 3.1.
+                        if self.rag_session is not None and self.rag_session.observe_user_frame(chunk):
+                            turn_record = await self.rag_session.fire_turn_injection_burst_async()
+                            clog.log(
+                                "info",
+                                f"[rag] turn boundary detected -> fired burst: "
+                                f"injected_tokens={turn_record['injected_token_count']} "
+                                f"injection_latency_s={turn_record.get('injection_latency_s')}",
+                            )
+                        # Mode E: fires on a fixed wall-clock interval regardless of turn
+                        # boundaries -- no-op unless dynamic_runtime is active and
+                        # prepare_dynamic_injection_knowledge() has armed a knowledge block. Same
+                        # self-contained-burst-before-this-frame's-real-step contract as Mode D
+                        # above.
+                        if self.rag_session is not None and self.rag_session.tick_dynamic_injection():
+                            dyn_record = await self.rag_session.fire_dynamic_injection_burst_async()
+                            clog.log(
+                                "info",
+                                f"[rag] dynamic-injection interval elapsed -> fired burst: "
+                                f"injected_tokens={dyn_record['injected_token_count']} "
+                                f"injection_latency_s={dyn_record.get('injection_latency_s')}",
+                            )
+                        chunk = torch.from_numpy(chunk)
+                        chunk = chunk.to(device=self.device)[None, None]
+                        codes = self.mimi.encode(chunk)
+                        _ = self.other_mimi.encode(chunk)
+                        for c in range(codes.shape[-1]):
+                            tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                            if tokens is None:
+                                continue
+                            assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                            main_pcm = self.mimi.decode(tokens[:, 1:9])
+                            _ = self.other_mimi.decode(tokens[:, 1:9])
+                            main_pcm = main_pcm.cpu()
+                            opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                            text_token = tokens[0, 0, 0].item()
+                            if text_token not in (0, 3):
+                                _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                                _text = _text.replace("▁", " ")
+                                msg = b"\x02" + bytes(_text, encoding="utf8")
+                                await ws.send_bytes(msg)
+                            else:
+                                text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+            except Exception:
+                # Without this, an exception anywhere in the per-frame pipeline above (a shape
+                # assertion, a CUDA error, an injection burst gone wrong, ...) would propagate out
+                # of this task unobserved by anything -- see the comment above `done, pending =
+                # await asyncio.wait(...)` below for why that previously meant the connection just
+                # silently stopped producing output ("froze") with no diagnosable cause, instead
+                # of closing. Log the full traceback so the real cause is visible, then stop via
+                # `close` so recv_loop/send_loop wind down too instead of one task being dead
+                # while the other two keep idling forever.
+                clog.log("error", f"opus_loop crashed:\n{traceback.format_exc()}")
+                close = True
 
         async def send_loop():
-            while True:
-                if close:
-                    return
-                await asyncio.sleep(0.001)
-                msg = opus_writer.read_bytes()
-                if len(msg) > 0:
-                    await ws.send_bytes(b"\x01" + msg)
+            nonlocal close
+            try:
+                while True:
+                    if close:
+                        return
+                    await asyncio.sleep(0.001)
+                    msg = opus_writer.read_bytes()
+                    if len(msg) > 0:
+                        await ws.send_bytes(b"\x01" + msg)
+            except Exception:
+                # See the matching comment in opus_loop -- same reasoning: surface and stop
+                # instead of leaving a silently-dead task other loops never learn about.
+                clog.log("error", f"send_loop crashed:\n{traceback.format_exc()}")
+                close = True
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -503,6 +534,23 @@ class ServerState:
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                # Every loop above (recv_loop/opus_loop/send_loop) now catches its own exceptions
+                # and logs them before returning normally, so in practice `done` tasks shouldn't
+                # raise here -- but check anyway: a task that completes with an *unhandled*
+                # exception (one of the loops above raising something this code doesn't already
+                # catch, or a bug in the exception handling itself) would otherwise be silently
+                # dropped here. Previously this was the actual mechanism behind reports of the
+                # stream "freezing" after several minutes with no error anywhere: whichever loop
+                # crashed first ended the `asyncio.wait` below with `FIRST_COMPLETED`, the
+                # exception was never retrieved, and the connection was torn down looking like a
+                # normal, silent close instead of the crash it actually was.
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        clog.log(
+                            "error",
+                            f"a connection task ended with an unhandled exception: {exc!r}",
+                        )
                 # Force-kill remaining tasks
                 for task in pending:
                     task.cancel()
